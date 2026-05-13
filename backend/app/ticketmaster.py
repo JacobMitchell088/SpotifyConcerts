@@ -1,8 +1,11 @@
 import asyncio
+import logging
 
 import httpx
 
 from .config import settings
+
+log = logging.getLogger("spotify-concerts.ticketmaster")
 
 API_BASE = "https://app.ticketmaster.com/discovery/v2"
 
@@ -48,21 +51,42 @@ async def find_concerts_for_artists(
     artist_names: list[str], latlong: str | None = None, radius: int = 50
 ) -> list[dict]:
     results = []
+    matched = 0
+    attractions_found = 0
+    location_note = f"latlong={latlong} radius={radius}" if latlong else "no location"
+    log.info(
+        "ticketmaster: searching %d artists (%s)",
+        len(artist_names),
+        location_note,
+    )
     async with httpx.AsyncClient(timeout=10.0) as client:
         for name in artist_names:
             try:
                 attraction_id = await find_attraction_id(client, name)
                 await asyncio.sleep(RATE_LIMIT_DELAY)
                 if not attraction_id:
+                    log.info("ticketmaster: '%s' → no attraction match", name)
                     continue
+                attractions_found += 1
                 events = await find_events(client, attraction_id, latlong, radius)
                 await asyncio.sleep(RATE_LIMIT_DELAY)
             except httpx.HTTPStatusError as e:
-                if e.response.status_code == 429:
+                status = e.response.status_code
+                body = e.response.text[:200]
+                log.warning(
+                    "ticketmaster: '%s' → HTTP %d: %s", name, status, body
+                )
+                if status == 429:
                     await asyncio.sleep(1.0)
                 continue
-            except httpx.HTTPError:
+            except httpx.HTTPError as e:
+                log.warning("ticketmaster: '%s' → transport error: %s", name, e)
                 continue
+            if events:
+                matched += 1
+                log.info("ticketmaster: '%s' → %d events", name, len(events))
+            else:
+                log.info("ticketmaster: '%s' → attraction found, 0 events", name)
             for ev in events:
                 venue = (ev.get("_embedded", {}).get("venues") or [{}])[0]
                 results.append(
@@ -75,4 +99,11 @@ async def find_concerts_for_artists(
                         "url": ev.get("url"),
                     }
                 )
+    log.info(
+        "ticketmaster: done — %d/%d attractions matched, %d artists with shows, %d total events",
+        attractions_found,
+        len(artist_names),
+        matched,
+        len(results),
+    )
     return results
