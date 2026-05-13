@@ -23,6 +23,11 @@ app.add_middleware(
 )
 
 
+@app.get("/")
+async def root():
+    return {"service": "spotify-concerts-api", "status": "ok"}
+
+
 @app.get("/api/auth/login")
 async def login(request: Request):
     url, state = spotify.build_authorize_url()
