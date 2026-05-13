@@ -9,7 +9,10 @@ from .config import settings
 app = FastAPI(title="Spotify Concerts")
 
 app.add_middleware(
-    SessionMiddleware, secret_key=settings.session_secret, same_site="lax"
+    SessionMiddleware,
+    secret_key=settings.session_secret,
+    same_site="lax",
+    https_only=settings.cookie_secure,
 )
 app.add_middleware(
     CORSMiddleware,
