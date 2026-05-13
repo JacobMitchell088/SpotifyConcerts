@@ -15,6 +15,19 @@ function parseDate(iso) {
   return { year: y, month: MONTHS[m - 1], day: d };
 }
 
+/* Pick a column count for the artist wall that keeps the grid rectangular.
+   Prefer 5 → 4 → 6 → 3 cols. If none divides cleanly, fall back to 5 with
+   placeholder tiles padding the last row. */
+function gridDims(n) {
+  if (n <= 1) return { cols: Math.max(1, n), pad: 0 };
+  if (n <= 5) return { cols: n, pad: 0 };
+  for (const c of [5, 4, 6, 3]) {
+    if (n % c === 0) return { cols: c, pad: 0 };
+  }
+  const cols = 5;
+  return { cols, pad: (cols - (n % cols)) % cols };
+}
+
 
 /* ---- inline brand marks ----------------------------------- */
 
@@ -30,8 +43,12 @@ function SpotifyMark(props) {
 export default function App() {
   const [authed, setAuthed] = useState(false);
   const [topArtists, setTopArtists] = useState([]);
+  const [customArtists, setCustomArtists] = useState([]); // [{name, image}]
+  const [customInput, setCustomInput] = useState('');
+  const [addingArtist, setAddingArtist] = useState(false);
   const [concerts, setConcerts] = useState([]);
   const [searched, setSearched] = useState(false);
+  const [lastSearchUsedLocation, setLastSearchUsedLocation] = useState(false);
   const [loading, setLoading] = useState(false);
   const [latlong, setLatlong] = useState('');
   const [radius, setRadius] = useState(50);
@@ -47,12 +64,6 @@ export default function App() {
       .then((d) => setAuthed(d.authenticated))
       .catch(() => setAuthed(false));
   }, []);
-
-  /* ---- on auth: pull location once ---- */
-  useEffect(() => {
-    if (!authed) return;
-    populateLocation();
-  }, [authed]);
 
   /* ---- fetch top artists whenever count or window changes ---- */
   useEffect(() => {
@@ -92,8 +103,49 @@ export default function App() {
     await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
     setAuthed(false);
     setTopArtists([]);
+    setCustomArtists([]);
     setConcerts([]);
     setSearched(false);
+  };
+
+  const addCustomArtist = async () => {
+    const v = customInput.trim();
+    if (!v || addingArtist) return;
+    setAddingArtist(true);
+    setStatusMsg('');
+    try {
+      // ask Spotify for the canonical name + image. fall back to typed text.
+      let resolved = { name: v, image: null };
+      try {
+        const r = await fetch(
+          `/api/search-artist?q=${encodeURIComponent(v)}`,
+          { credentials: 'include' }
+        );
+        if (r.ok) {
+          const data = await r.json();
+          if (data && data.name) resolved = data;
+        }
+      } catch {
+        /* fall through to typed-text fallback */
+      }
+      const key = resolved.name.toLowerCase();
+      const dup =
+        topArtists.some((a) => a.name.toLowerCase() === key) ||
+        customArtists.some((c) => c.name.toLowerCase() === key);
+      if (dup) {
+        setStatusMsg(`"${resolved.name}" is already in the list.`);
+        setCustomInput('');
+        return;
+      }
+      setCustomArtists((prev) => [...prev, resolved]);
+      setCustomInput('');
+    } finally {
+      setAddingArtist(false);
+    }
+  };
+
+  const removeCustomArtist = (name) => {
+    setCustomArtists((prev) => prev.filter((c) => c.name !== name));
   };
 
   const populateLocation = () => {
@@ -135,6 +187,9 @@ export default function App() {
       params.set('latlong', coords);
       params.set('radius', String(radius));
     }
+    for (const c of customArtists) {
+      params.append('extra_artists', c.name);
+    }
     try {
       const r = await fetch(`/api/concerts?${params}`, { credentials: 'include' });
       if (r.status === 401) {
@@ -149,6 +204,7 @@ export default function App() {
       }
       const data = await r.json();
       setConcerts(Array.isArray(data) ? data : []);
+      setLastSearchUsedLocation(!!coords);
       setSearched(true);
     } catch (e) {
       setStatusMsg(`Network error: ${e.message}`);
@@ -161,10 +217,28 @@ export default function App() {
     return <Landing onLogin={login} />;
   }
 
-  const groupedByArtist = topArtists.map((a, i) => ({
+  const allArtists = [
+    ...topArtists.map((a, i) => ({
+      name: a.name,
+      image: a.image,
+      label: String(i + 1).padStart(2, '0'),
+      custom: false,
+    })),
+    ...customArtists.map((c) => ({
+      name: c.name,
+      image: c.image,
+      label: '+ ADDED',
+      custom: true,
+    })),
+  ];
+
+  const { cols, pad } = gridDims(allArtists.length);
+
+  const groupedByArtist = allArtists.map((a, i) => ({
     artist: a.name,
     image: a.image,
-    index: i + 1,
+    custom: a.custom,
+    label: a.custom ? '+ ADDED' : `No. ${String(i + 1).padStart(2, '0')}`,
     shows: concerts.filter((c) => c.artist === a.name),
   }));
 
@@ -178,31 +252,84 @@ export default function App() {
         <section className="rise">
           <div className="section-head">
             <h2 className="display">Now tracking</h2>
-            <span className="kicker">{TIME_RANGE_LABEL[timeRange]} · {topArtists.length} artists</span>
+            <span className="kicker">
+              {TIME_RANGE_LABEL[timeRange]} · {topArtists.length} top
+              {customArtists.length > 0 && ` · ${customArtists.length} added`}
+            </span>
           </div>
           <p className="muted" style={{ marginTop: 0, maxWidth: '52ch' }}>
-            We'll match each of these against upcoming shows on Ticketmaster. Adjust the
-            controls below to widen or narrow the scope.
+            We'll match each of these against upcoming shows on Ticketmaster. Add
+            your own artists below if they're not in your top listened, or adjust
+            the controls to widen or narrow the scope.
           </p>
         </section>
 
-        <div className="artists-wall rise-stagger" style={{ marginTop: '1.5rem' }}>
-          {topArtists.map((a, i) => (
+        <div
+          className="artists-wall rise-stagger"
+          style={{ marginTop: '1.5rem', '--cols': cols }}
+        >
+          {allArtists.map((a) => (
             <article
-              key={a.name}
-              className={`artist-tile ${a.image ? '' : 'no-image'}`}
+              key={(a.custom ? 'c:' : 't:') + a.name}
+              className={
+                'artist-tile' +
+                (a.image ? '' : ' no-image') +
+                (a.custom ? ' custom' : '')
+              }
             >
               {a.image && (
-                <div
-                  className="image"
-                  style={{ backgroundImage: `url(${a.image})` }}
-                  role="presentation"
-                />
+                <>
+                  <div
+                    className="image"
+                    style={{ backgroundImage: `url(${a.image})` }}
+                    role="presentation"
+                  />
+                  <div className="shade" aria-hidden="true" />
+                </>
               )}
-              <span className="num">{String(i + 1).padStart(2, '0')}</span>
+              <span className="num">{a.label}</span>
+              {a.custom && (
+                <button
+                  className="remove-custom"
+                  onClick={() => removeCustomArtist(a.name)}
+                  aria-label={`Remove ${a.name}`}
+                  title={`Remove ${a.name}`}
+                >
+                  ×
+                </button>
+              )}
               <div className="name">{a.name}</div>
             </article>
           ))}
+          {Array.from({ length: pad }, (_, i) => (
+            <div
+              key={`pad-${i}`}
+              className="artist-tile placeholder"
+              aria-hidden="true"
+            />
+          ))}
+        </div>
+
+        <div className="add-artist-bar">
+          <span className="label-mono">Add an artist</span>
+          <input
+            value={customInput}
+            placeholder="Type a band or performer, then Enter"
+            onChange={(e) => setCustomInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                addCustomArtist();
+              }
+            }}
+          />
+          <button
+            className="btn-ghost"
+            onClick={addCustomArtist}
+            disabled={!customInput.trim() || addingArtist}
+          >
+            {addingArtist ? '…' : 'Add'}
+          </button>
         </div>
 
         <section className="rise">
@@ -281,7 +408,9 @@ export default function App() {
           </div>
 
           <p className="controls-hint">
-            Short · 4 weeks &nbsp;&middot;&nbsp; Medium · 6 months &nbsp;&middot;&nbsp; Long · 1 year of listening history
+            Leave location blank to search all upcoming shows for these artists.
+            &nbsp;&middot;&nbsp; Short · 4 weeks &nbsp;&middot;&nbsp; Medium · 6 months
+            &nbsp;&middot;&nbsp; Long · 1 year
           </p>
 
           {statusMsg && <p className="controls-status">{statusMsg}</p>}
@@ -306,8 +435,9 @@ export default function App() {
 
           {searched && !loading && !anyShows && (
             <p className="results-empty">
-              No upcoming shows found for your top artists within {radius} miles.
-              Widen the radius or broaden the listening window.
+              {lastSearchUsedLocation
+                ? `No upcoming shows found within ${radius} miles. Widen the radius or clear the location to see all shows.`
+                : 'No upcoming shows found for these artists. Try the longer listening window, add artists manually, or check back later.'}
             </p>
           )}
 
@@ -398,7 +528,7 @@ function ArtistBlock({ group }) {
   return (
     <section className="artist-block">
       <header className="artist-header">
-        <span className="num">No. {String(group.index).padStart(2, '0')}</span>
+        <span className="num">{group.label}</span>
         <h3 className="name">{group.artist}</h3>
         <span className="count">
           {group.shows.length} show{group.shows.length > 1 ? 's' : ''}
@@ -447,7 +577,7 @@ function ShowStub({ show }) {
             target="_blank"
             rel="noreferrer"
           >
-            Get tickets <span className="tm-credit">via Ticketmaster ↗</span>
+            Get Tickets <span className="arrow" aria-hidden="true">↗</span>
           </a>
         )}
       </div>

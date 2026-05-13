@@ -73,3 +73,24 @@ async def get_top_artists(
             raise SpotifyAuthError("access token rejected")
         r.raise_for_status()
         return r.json()["items"]
+
+
+async def search_artist(access_token: str, query: str) -> dict | None:
+    """Return the top-matching artist for `query`, or None if Spotify has no match."""
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{API_BASE}/search",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"q": query, "type": "artist", "limit": 1},
+        )
+        if r.status_code == 401:
+            raise SpotifyAuthError("access token rejected")
+        r.raise_for_status()
+        items = r.json().get("artists", {}).get("items", [])
+        if not items:
+            return None
+        a = items[0]
+        return {
+            "name": a["name"],
+            "image": a["images"][0]["url"] if a.get("images") else None,
+        }
