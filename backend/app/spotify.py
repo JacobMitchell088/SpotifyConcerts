@@ -12,6 +12,15 @@ API_BASE = "https://api.spotify.com/v1"
 SCOPES = "user-top-read"
 
 
+class SpotifyAuthError(Exception):
+    pass
+
+
+def _basic_auth_header() -> str:
+    creds = f"{settings.spotify_client_id}:{settings.spotify_client_secret}"
+    return "Basic " + base64.b64encode(creds.encode()).decode()
+
+
 def build_authorize_url() -> tuple[str, str]:
     state = secrets.token_urlsafe(16)
     params = {
@@ -25,12 +34,10 @@ def build_authorize_url() -> tuple[str, str]:
 
 
 async def exchange_code(code: str) -> dict:
-    creds = f"{settings.spotify_client_id}:{settings.spotify_client_secret}"
-    auth = base64.b64encode(creds.encode()).decode()
     async with httpx.AsyncClient() as client:
         r = await client.post(
             TOKEN_URL,
-            headers={"Authorization": f"Basic {auth}"},
+            headers={"Authorization": _basic_auth_header()},
             data={
                 "grant_type": "authorization_code",
                 "code": code,
@@ -38,6 +45,18 @@ async def exchange_code(code: str) -> dict:
             },
         )
         r.raise_for_status()
+        return r.json()
+
+
+async def refresh_access_token(refresh_token: str) -> dict:
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            TOKEN_URL,
+            headers={"Authorization": _basic_auth_header()},
+            data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+        )
+        if r.status_code != 200:
+            raise SpotifyAuthError(f"refresh failed: {r.status_code} {r.text}")
         return r.json()
 
 
@@ -50,5 +69,7 @@ async def get_top_artists(
             headers={"Authorization": f"Bearer {access_token}"},
             params={"time_range": time_range, "limit": limit},
         )
+        if r.status_code == 401:
+            raise SpotifyAuthError("access token rejected")
         r.raise_for_status()
         return r.json()["items"]

@@ -41,6 +41,8 @@ async def callback(request: Request, code: str, state: str):
         raise HTTPException(400, "invalid state")
     tokens = await spotify.exchange_code(code)
     request.session["access_token"] = tokens["access_token"]
+    if "refresh_token" in tokens:
+        request.session["refresh_token"] = tokens["refresh_token"]
     return RedirectResponse(settings.frontend_url)
 
 
@@ -55,14 +57,36 @@ async def logout(request: Request):
     return {"ok": True}
 
 
+async def _fetch_top_artists(request: Request, time_range: str, limit: int):
+    """Fetch top artists, transparently refreshing the access token on 401."""
+    token = request.session.get("access_token")
+    if not token:
+        raise HTTPException(401, "not authenticated")
+    try:
+        return await spotify.get_top_artists(token, time_range, limit)
+    except spotify.SpotifyAuthError:
+        refresh = request.session.get("refresh_token")
+        if not refresh:
+            request.session.clear()
+            raise HTTPException(401, "session expired, please log in again")
+        try:
+            new_tokens = await spotify.refresh_access_token(refresh)
+        except spotify.SpotifyAuthError:
+            request.session.clear()
+            raise HTTPException(401, "session expired, please log in again")
+        request.session["access_token"] = new_tokens["access_token"]
+        if "refresh_token" in new_tokens:
+            request.session["refresh_token"] = new_tokens["refresh_token"]
+        return await spotify.get_top_artists(
+            new_tokens["access_token"], time_range, limit
+        )
+
+
 @app.get("/api/top-artists")
 async def top_artists(
     request: Request, time_range: str = "long_term", limit: int = 20
 ):
-    token = request.session.get("access_token")
-    if not token:
-        raise HTTPException(401, "not authenticated")
-    artists = await spotify.get_top_artists(token, time_range, limit)
+    artists = await _fetch_top_artists(request, time_range, limit)
     return [
         {
             "name": a["name"],
@@ -81,9 +105,6 @@ async def concerts(
     limit: int = 10,
     time_range: str = "long_term",
 ):
-    token = request.session.get("access_token")
-    if not token:
-        raise HTTPException(401, "not authenticated")
-    artists = await spotify.get_top_artists(token, time_range=time_range, limit=limit)
+    artists = await _fetch_top_artists(request, time_range, limit)
     names = [a["name"] for a in artists]
     return await ticketmaster.find_concerts_for_artists(names, latlong, radius)
