@@ -16,6 +16,7 @@ class Job:
     status: str = "pending"  # pending | running | done | error
     results: list[dict] = field(default_factory=list)
     error: str | None = None
+    warning: str | None = None
     started_at: float = field(default_factory=time.time)
     finished_at: float | None = None
 
@@ -41,6 +42,7 @@ class Job:
             "eta_seconds": round(eta, 2) if eta is not None else None,
             "results": self.results if self.status == "done" else [],
             "error": self.error,
+            "warning": self.warning,
         }
 
 
@@ -83,6 +85,12 @@ class JobStore:
                 job.results = results
                 job.completed = job.total
                 job.finished_at = time.time()
+
+    async def set_warning(self, job_id: str, warning: str) -> None:
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            if job:
+                job.warning = warning
 
     async def mark_error(self, job_id: str, error: str) -> None:
         async with self._lock:

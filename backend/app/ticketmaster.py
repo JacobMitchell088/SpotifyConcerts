@@ -88,27 +88,15 @@ async def find_events(
     *,
     latlong: str | None = None,
     radius: int = 50,
-    city: str | None = None,
-    postal_code: str | None = None,
 ) -> list[dict]:
     params: dict = {
         "attractionId": attraction_id,
         "apikey": settings.ticketmaster_api_key,
         "size": 10,
         "sort": "date,asc",
-        # Filter out sports / theatre / "events with this artist" misclassifications.
-        "classificationName": "music",
     }
     if latlong:
         params["latlong"] = latlong
-        params["radius"] = radius
-        params["unit"] = "miles"
-    elif city:
-        params["city"] = city
-        params["radius"] = radius
-        params["unit"] = "miles"
-    elif postal_code:
-        params["postalCode"] = postal_code
         params["radius"] = radius
         params["unit"] = "miles"
     r = await _request_with_retry(client, f"{API_BASE}/events.json", params)
@@ -120,8 +108,6 @@ async def find_concerts_for_artists(
     *,
     latlong: str | None = None,
     radius: int = 50,
-    city: str | None = None,
-    postal_code: str | None = None,
     progress_cb: ProgressCallback = None,
 ) -> list[dict]:
     results: list[dict] = []
@@ -132,14 +118,9 @@ async def find_concerts_for_artists(
     lock = asyncio.Lock()
     semaphore = asyncio.Semaphore(CONCURRENCY)
 
-    if city:
-        location_note = f"city={city} radius={radius}"
-    elif postal_code:
-        location_note = f"postal_code={postal_code} radius={radius}"
-    elif latlong:
-        location_note = f"latlong={latlong} radius={radius}"
-    else:
-        location_note = "no location"
+    location_note = (
+        f"latlong={latlong} radius={radius}" if latlong else "no location"
+    )
     log.info("ticketmaster: searching %d artists (%s)", total, location_note)
 
     async def process(name: str, client: httpx.AsyncClient) -> None:
@@ -151,12 +132,7 @@ async def find_concerts_for_artists(
                     log.info("ticketmaster: '%s' → no attraction match", name)
                 else:
                     events = await find_events(
-                        client,
-                        attraction_id,
-                        latlong=latlong,
-                        radius=radius,
-                        city=city,
-                        postal_code=postal_code,
+                        client, attraction_id, latlong=latlong, radius=radius
                     )
                     async with lock:
                         attractions_found += 1

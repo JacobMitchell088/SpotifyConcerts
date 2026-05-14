@@ -41,7 +41,7 @@ async def test_request_with_retry_gives_up_after_attempts(monkeypatch):
             )
 
 
-async def test_find_events_passes_city_param():
+async def test_find_events_passes_latlong_and_radius():
     captured = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -50,14 +50,15 @@ async def test_find_events_passes_city_param():
 
     async with _mock_client(handler) as client:
         await ticketmaster.find_events(
-            client, "A1", city="Brooklyn", radius=25
+            client, "A1", latlong="40.7,-74.0", radius=25
         )
-    assert "city=Brooklyn" in captured["url"]
-    assert "radius=25" in captured["url"]
-    assert "classificationName=music" in captured["url"]
+    url = captured["url"]
+    assert "latlong=40.7%2C-74.0" in url or "latlong=40.7,-74.0" in url
+    assert "radius=25" in url
+    assert "unit=miles" in url
 
 
-async def test_find_events_passes_postal_code_param():
+async def test_find_events_omits_location_when_not_provided():
     captured = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -65,25 +66,10 @@ async def test_find_events_passes_postal_code_param():
         return httpx.Response(200, json={"_embedded": {"events": []}})
 
     async with _mock_client(handler) as client:
-        await ticketmaster.find_events(client, "A1", postal_code="11201")
-    assert "postalCode=11201" in captured["url"]
-
-
-async def test_find_events_prefers_latlong_over_city():
-    """When both are set the lat/long should win (caller's responsibility,
-    but the function itself encodes this priority)."""
-    captured = {}
-
-    def handler(req: httpx.Request) -> httpx.Response:
-        captured["url"] = str(req.url)
-        return httpx.Response(200, json={"_embedded": {"events": []}})
-
-    async with _mock_client(handler) as client:
-        await ticketmaster.find_events(
-            client, "A1", latlong="40.7,-74.0", city="Brooklyn"
-        )
-    assert "latlong=" in captured["url"]
-    assert "city=" not in captured["url"]
+        await ticketmaster.find_events(client, "A1")
+    url = captured["url"]
+    assert "latlong" not in url
+    assert "radius" not in url
 
 
 async def test_find_concerts_calls_progress_cb(monkeypatch):
