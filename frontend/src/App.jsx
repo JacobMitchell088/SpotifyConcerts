@@ -50,7 +50,9 @@ export default function App() {
   const [searched, setSearched] = useState(false);
   const [lastSearchUsedLocation, setLastSearchUsedLocation] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState(null); // {completed, total, etaSeconds}
   const [latlong, setLatlong] = useState('');
+  const [whereInput, setWhereInput] = useState(''); // city or ZIP
   const [radius, setRadius] = useState(50);
   const [artistCount, setArtistCount] = useState(10);
   const [timeRange, setTimeRange] = useState('long_term');
@@ -178,20 +180,38 @@ export default function App() {
 
   const loadConcerts = async () => {
     setLoading(true);
+    setProgress(null);
     setStatusMsg('');
     const params = new URLSearchParams();
     params.set('limit', String(artistCount));
     params.set('time_range', timeRange);
+
     const coords = latlong.trim();
+    const where = whereInput.trim();
+    let usedLocation = false;
+    // latlong (from "Use mine") wins over typed city/ZIP.
     if (coords) {
       params.set('latlong', coords);
       params.set('radius', String(radius));
+      usedLocation = true;
+    } else if (where) {
+      // Treat values that are mostly digits (with optional dashes/spaces) as ZIP.
+      if (/^[0-9][0-9\s-]{1,11}$/.test(where)) {
+        params.set('postal_code', where.replace(/\s+/g, ''));
+      } else {
+        params.set('city', where);
+      }
+      params.set('radius', String(radius));
+      usedLocation = true;
     }
     for (const c of customArtists) {
       params.append('extra_artists', c.name);
     }
     try {
-      const r = await fetch(`/api/concerts?${params}`, { credentials: 'include' });
+      const r = await fetch(`/api/concerts?${params}`, {
+        method: 'POST',
+        credentials: 'include',
+      });
       if (r.status === 401) {
         setAuthed(false);
         setStatusMsg('Spotify session expired — please log in again.');
@@ -202,14 +222,54 @@ export default function App() {
         setStatusMsg(`Search failed (${r.status}). ${body.slice(0, 140)}`);
         return;
       }
-      const data = await r.json();
-      setConcerts(Array.isArray(data) ? data : []);
-      setLastSearchUsedLocation(!!coords);
+      const { job_id, total } = await r.json();
+      setProgress({ completed: 0, total, etaSeconds: null });
+      const final = await pollJob(job_id);
+      if (!final) return; // status already set by poller
+      setConcerts(Array.isArray(final.results) ? final.results : []);
+      setLastSearchUsedLocation(usedLocation);
       setSearched(true);
     } catch (e) {
       setStatusMsg(`Network error: ${e.message}`);
     } finally {
       setLoading(false);
+      setProgress(null);
+    }
+  };
+
+  const pollJob = async (jobId) => {
+    // Poll every 600ms until the job ends. Returns the final job dict, or null on error.
+    const POLL_MS = 600;
+    const MAX_WAIT_MS = 120_000;
+    const started = Date.now();
+    while (true) {
+      if (Date.now() - started > MAX_WAIT_MS) {
+        setStatusMsg('Search timed out after 2 minutes.');
+        return null;
+      }
+      let r;
+      try {
+        r = await fetch(`/api/concerts/${jobId}`, { credentials: 'include' });
+      } catch (e) {
+        setStatusMsg(`Network error while polling: ${e.message}`);
+        return null;
+      }
+      if (!r.ok) {
+        setStatusMsg(`Lost the search job (${r.status}). Try again.`);
+        return null;
+      }
+      const job = await r.json();
+      setProgress({
+        completed: job.completed,
+        total: job.total,
+        etaSeconds: job.eta_seconds,
+      });
+      if (job.status === 'done') return job;
+      if (job.status === 'error') {
+        setStatusMsg(`Search failed: ${job.error || 'unknown error'}`);
+        return null;
+      }
+      await new Promise((resolve) => setTimeout(resolve, POLL_MS));
     }
   };
 
@@ -340,20 +400,21 @@ export default function App() {
 
           <div className="controls-strip">
             <div className="ctrl ctrl-location">
-              <span className="label-mono">Location · lat, lng</span>
+              <span className="label-mono">Where · city or ZIP</span>
               <div className="ctrl-row">
                 <input
-                  placeholder="40.7128, -74.0060"
-                  value={latlong}
-                  onChange={(e) => setLatlong(e.target.value)}
+                  placeholder={latlong ? 'Using your location' : 'Brooklyn, NY  or  11201'}
+                  value={whereInput}
+                  disabled={!!latlong}
+                  onChange={(e) => setWhereInput(e.target.value)}
                 />
                 <button
                   className="btn-ghost"
-                  onClick={populateLocation}
+                  onClick={latlong ? () => setLatlong('') : populateLocation}
                   disabled={locating}
-                  title="Use browser location"
+                  title={latlong ? 'Clear current location' : 'Use browser location'}
                 >
-                  {locating ? '…' : 'Use mine'}
+                  {locating ? '…' : latlong ? 'Clear' : 'Use mine'}
                 </button>
               </div>
             </div>
@@ -412,6 +473,10 @@ export default function App() {
             &nbsp;&middot;&nbsp; Short · 4 weeks &nbsp;&middot;&nbsp; Medium · 6 months
             &nbsp;&middot;&nbsp; Long · 1 year
           </p>
+
+          {loading && progress && progress.total > 0 && (
+            <ProgressBar progress={progress} />
+          )}
 
           {statusMsg && <p className="controls-status">{statusMsg}</p>}
         </section>
@@ -519,6 +584,31 @@ function Landing({ onLogin }) {
       </section>
 
       <Colophon />
+    </div>
+  );
+}
+
+
+function ProgressBar({ progress }) {
+  const { completed, total, etaSeconds } = progress;
+  const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
+  let etaLabel = 'estimating…';
+  if (etaSeconds != null) {
+    if (etaSeconds < 1) etaLabel = 'almost done';
+    else if (etaSeconds < 60) etaLabel = `~${Math.ceil(etaSeconds)}s left`;
+    else etaLabel = `~${Math.ceil(etaSeconds / 60)} min left`;
+  }
+  return (
+    <div className="progress-strip" role="status" aria-live="polite">
+      <div className="progress-track">
+        <div className="progress-fill" style={{ width: `${pct}%` }} />
+      </div>
+      <div className="progress-meta label-mono">
+        <span>
+          {completed} / {total} artists scanned
+        </span>
+        <span>{etaLabel}</span>
+      </div>
     </div>
   );
 }

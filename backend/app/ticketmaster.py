@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import random
+from typing import Awaitable, Callable
 
 import httpx
 
@@ -9,19 +11,73 @@ log = logging.getLogger("spotify-concerts.ticketmaster")
 
 API_BASE = "https://app.ticketmaster.com/discovery/v2"
 
-RATE_LIMIT_DELAY = 0.25
+# Free tier is 5 req/s. We fan out with a semaphore and keep enough headroom
+# that retries on 429 don't push us over.
+CONCURRENCY = 4
+RETRY_ATTEMPTS = 3
+RETRY_BASE_DELAY = 0.5  # seconds, exponential backoff with jitter
 
 
-async def find_attraction_id(client: httpx.AsyncClient, artist_name: str) -> str | None:
-    r = await client.get(
+ProgressCallback = Callable[[int, int], None] | None
+
+
+async def _request_with_retry(
+    client: httpx.AsyncClient, url: str, params: dict
+) -> httpx.Response:
+    """GET with exponential-backoff retry on 429 and 5xx."""
+    last_exc: Exception | None = None
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            r = await client.get(url, params=params)
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                # Respect Retry-After when present; otherwise backoff with jitter.
+                retry_after = r.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    delay = float(retry_after)
+                else:
+                    delay = RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, 0.25)
+                if attempt < RETRY_ATTEMPTS - 1:
+                    log.info(
+                        "ticketmaster: %d on %s, retrying in %.2fs",
+                        r.status_code,
+                        url.split("/")[-1],
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+            r.raise_for_status()
+            return r
+        except httpx.HTTPError as e:
+            last_exc = e
+            if attempt < RETRY_ATTEMPTS - 1:
+                delay = RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, 0.25)
+                log.info(
+                    "ticketmaster: transport error on attempt %d, retry in %.2fs: %s",
+                    attempt + 1,
+                    delay,
+                    e,
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise
+    # Shouldn't reach here, but keep type checker happy.
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("retry loop exited without response")
+
+
+async def find_attraction_id(
+    client: httpx.AsyncClient, artist_name: str
+) -> str | None:
+    r = await _request_with_retry(
+        client,
         f"{API_BASE}/attractions.json",
-        params={
+        {
             "keyword": artist_name,
             "apikey": settings.ticketmaster_api_key,
             "size": 1,
         },
     )
-    r.raise_for_status()
     attractions = r.json().get("_embedded", {}).get("attractions", [])
     return attractions[0]["id"] if attractions else None
 
@@ -29,80 +85,130 @@ async def find_attraction_id(client: httpx.AsyncClient, artist_name: str) -> str
 async def find_events(
     client: httpx.AsyncClient,
     attraction_id: str,
-    latlong: str | None,
-    radius: int,
+    *,
+    latlong: str | None = None,
+    radius: int = 50,
+    city: str | None = None,
+    postal_code: str | None = None,
 ) -> list[dict]:
-    params = {
+    params: dict = {
         "attractionId": attraction_id,
         "apikey": settings.ticketmaster_api_key,
         "size": 10,
         "sort": "date,asc",
+        # Filter out sports / theatre / "events with this artist" misclassifications.
+        "classificationName": "music",
     }
     if latlong:
         params["latlong"] = latlong
         params["radius"] = radius
         params["unit"] = "miles"
-    r = await client.get(f"{API_BASE}/events.json", params=params)
-    r.raise_for_status()
+    elif city:
+        params["city"] = city
+        params["radius"] = radius
+        params["unit"] = "miles"
+    elif postal_code:
+        params["postalCode"] = postal_code
+        params["radius"] = radius
+        params["unit"] = "miles"
+    r = await _request_with_retry(client, f"{API_BASE}/events.json", params)
     return r.json().get("_embedded", {}).get("events", [])
 
 
 async def find_concerts_for_artists(
-    artist_names: list[str], latlong: str | None = None, radius: int = 50
+    artist_names: list[str],
+    *,
+    latlong: str | None = None,
+    radius: int = 50,
+    city: str | None = None,
+    postal_code: str | None = None,
+    progress_cb: ProgressCallback = None,
 ) -> list[dict]:
-    results = []
+    results: list[dict] = []
+    total = len(artist_names)
+    completed = 0
     matched = 0
     attractions_found = 0
-    location_note = f"latlong={latlong} radius={radius}" if latlong else "no location"
-    log.info(
-        "ticketmaster: searching %d artists (%s)",
-        len(artist_names),
-        location_note,
-    )
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        for name in artist_names:
-            try:
+    lock = asyncio.Lock()
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+
+    if city:
+        location_note = f"city={city} radius={radius}"
+    elif postal_code:
+        location_note = f"postal_code={postal_code} radius={radius}"
+    elif latlong:
+        location_note = f"latlong={latlong} radius={radius}"
+    else:
+        location_note = "no location"
+    log.info("ticketmaster: searching %d artists (%s)", total, location_note)
+
+    async def process(name: str, client: httpx.AsyncClient) -> None:
+        nonlocal completed, matched, attractions_found
+        try:
+            async with semaphore:
                 attraction_id = await find_attraction_id(client, name)
-                await asyncio.sleep(RATE_LIMIT_DELAY)
                 if not attraction_id:
                     log.info("ticketmaster: '%s' → no attraction match", name)
-                    continue
-                attractions_found += 1
-                events = await find_events(client, attraction_id, latlong, radius)
-                await asyncio.sleep(RATE_LIMIT_DELAY)
-            except httpx.HTTPStatusError as e:
-                status = e.response.status_code
-                body = e.response.text[:200]
-                log.warning(
-                    "ticketmaster: '%s' → HTTP %d: %s", name, status, body
-                )
-                if status == 429:
-                    await asyncio.sleep(1.0)
-                continue
-            except httpx.HTTPError as e:
-                log.warning("ticketmaster: '%s' → transport error: %s", name, e)
-                continue
-            if events:
-                matched += 1
-                log.info("ticketmaster: '%s' → %d events", name, len(events))
-            else:
-                log.info("ticketmaster: '%s' → attraction found, 0 events", name)
-            for ev in events:
-                venue = (ev.get("_embedded", {}).get("venues") or [{}])[0]
-                results.append(
-                    {
-                        "artist": name,
-                        "name": ev.get("name"),
-                        "date": ev.get("dates", {}).get("start", {}).get("localDate"),
-                        "venue": venue.get("name"),
-                        "city": (venue.get("city") or {}).get("name"),
-                        "url": ev.get("url"),
-                    }
-                )
+                else:
+                    events = await find_events(
+                        client,
+                        attraction_id,
+                        latlong=latlong,
+                        radius=radius,
+                        city=city,
+                        postal_code=postal_code,
+                    )
+                    async with lock:
+                        attractions_found += 1
+                        if events:
+                            matched += 1
+                            log.info(
+                                "ticketmaster: '%s' → %d events", name, len(events)
+                            )
+                        else:
+                            log.info(
+                                "ticketmaster: '%s' → attraction found, 0 events",
+                                name,
+                            )
+                        for ev in events:
+                            venue = (ev.get("_embedded", {}).get("venues") or [{}])[0]
+                            results.append(
+                                {
+                                    "artist": name,
+                                    "name": ev.get("name"),
+                                    "date": ev.get("dates", {})
+                                    .get("start", {})
+                                    .get("localDate"),
+                                    "venue": venue.get("name"),
+                                    "city": (venue.get("city") or {}).get("name"),
+                                    "url": ev.get("url"),
+                                }
+                            )
+        except httpx.HTTPStatusError as e:
+            log.warning(
+                "ticketmaster: '%s' → HTTP %d (giving up): %s",
+                name,
+                e.response.status_code,
+                e.response.text[:200],
+            )
+        except httpx.HTTPError as e:
+            log.warning("ticketmaster: '%s' → transport error: %s", name, e)
+        finally:
+            async with lock:
+                completed += 1
+                if progress_cb:
+                    try:
+                        progress_cb(completed, total)
+                    except Exception:
+                        log.exception("ticketmaster: progress callback failed")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        await asyncio.gather(*(process(n, client) for n in artist_names))
+
     log.info(
         "ticketmaster: done — %d/%d attractions matched, %d artists with shows, %d total events",
         attractions_found,
-        len(artist_names),
+        total,
         matched,
         len(results),
     )
