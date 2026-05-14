@@ -1,41 +1,56 @@
 # Spotify Concerts
->Author: Jacob Mitchell   
->Date: 5/13/26    
+> Author: Jacob Mitchell    
+> Date: 5/14/26   
 
-View Live Site Here: https://spotifyconcerts.onrender.com/   
-> Cold start of ~60 seconds   
+View Live Site Here: https://spotifyconcerts.onrender.com/
+> Cold start of ~60 seconds
 
-Find upcoming concerts for the artists you actually listen to. Logs in with your Spotify account, pulls your top artists from the Spotify Web API, then looks up nearby shows for each one via the Ticketmaster Discovery API.   
+Find upcoming concerts for the artists you actually listen to. Logs in with your Spotify account, pulls your top artists from the Spotify Web API, then looks up nearby shows for each one via the Ticketmaster Discovery API.
 
-- **Backend:** Python 3.10+ / FastAPI / httpx
+- **Backend:** Python 3.13 / FastAPI / httpx
 - **Frontend:** React 18 + Vite (JSX)
 - **Auth:** Spotify OAuth Authorization Code flow (server-side, session-based)
-- **Designed for:** local development + Render deployment
+- **Geocoding:** OpenStreetMap Nominatim (free, no API key)
+- **Tests:** pytest + GitHub Actions CI
+- **Deployment:** Render
 
 ---
 
 ## Features
 
-- Spotify OAuth login (no password handling — Spotify owns the session).
-- Pulls your top **5–25 artists** for a configurable listening window:
-  - **Short term** — last ~4 weeks
-  - **Medium term** — last ~6 months
-  - **Long term** — last ~1 year
-- Auto-fetches browser location and pre-fills lat/lng (with a "Use my location" button to refresh).
-- Search radius adjustable 1–500 mi.
-- Results grouped by artist with the artist name as a section header; each show is a card showing date, venue, city, and a "Tickets" link to Ticketmaster.
-- Three-column card grid that collapses gracefully on smaller screens.
-- Rate-limit-aware Ticketmaster calls (throttled to stay under the free-tier 5 req/sec cap, skips individual artist failures instead of crashing the request).
+- **Spotify OAuth login** — no password handling, Spotify owns the session. Refresh-token aware: access tokens that expire mid-session are refreshed transparently before the next call.
+- **Top 5–25 artists** across three listening windows:
+  - Short — last ~4 weeks
+  - Medium — last ~6 months
+  - Long — last ~1 year
+- **Add your own artists** manually — autocompletes against Spotify to use the canonical name + image, deduped case-insensitively against your top list.
+- **Flexible "Where" input** — single field accepts:
+  - `City, ST` (e.g. `St. Louis, MO`)
+  - US ZIP (`11201` or `11201-1234`)
+  - `lat,lng` (`38.6,-90.1`)
+  - bare city name
+  - or click **Use mine** to pull browser geolocation
+  - a live readout chip under the input shows what was parsed
+- **Geocoded radius search.** Ticketmaster's `city` filter is exact-substring match, so this app geocodes any text location to lat/lng via Nominatim and uses the great-circle `latlong + radius` search instead. Cache + 1 req/sec throttle keep us within OSM's free-use policy.
+- **Adjustable radius** 1–500 mi, with min/max badges visible on every input.
+- **Custom +/− stepper** for the Top Artists count, alongside free-typing.
+- **Async job-based search** — `POST /api/concerts` returns a job ID; the frontend polls progress (`completed / total`, ETA in seconds/minutes) and renders a striped progress bar while Ticketmaster lookups fan out in parallel.
+- **Parallelized Ticketmaster client** — `asyncio.Semaphore(4)` with exponential-backoff retries on 429/5xx, honoring `Retry-After`. A 20-artist search drops from ~10s to ~3s.
+- **Server-side input clamps** on radius / artist count / extra artists so the public knobs can't amplify upstream usage.
+- **Results grouped by artist**, each show rendered as a poster-stub card with date, venue, city, and a "Get Tickets" link to Ticketmaster.
+- **Poster-aesthetic UI** — Hatch Show Print / risograph type, restrained CSS-only motion, paper grain via inline SVG. Respects `prefers-reduced-motion`.
 
 ---
 
 ## Prerequisites
 
-- Python 3.10 or higher (3.13 recommended — matches Render's supported runtimes).
+- Python 3.13 recommended (matches Render's pinned runtime and CI).
 - Node.js 18+ and npm.
 - A free Spotify Developer account.
 - A free Ticketmaster Developer account.
-- Either `venv` or Conda for managing the Python environment.
+- `venv` or Conda for the Python environment.
+
+No account or key needed for Nominatim — it's anonymous, just requires a descriptive User-Agent which the code already sets.
 
 ---
 
@@ -44,7 +59,7 @@ Find upcoming concerts for the artists you actually listen to. Logs in with your
 ### 1. Clone
 
 ```bash
-git clone https://github.com/<you>/SpotifyConcerts.git
+git clone https://github.com/JacobMitchell088/SpotifyConcerts.git
 cd SpotifyConcerts
 ```
 
@@ -77,7 +92,7 @@ cd backend
 cp .env.example .env
 ```
 
-Edit `.env` and fill in the five values:
+Edit `.env` and fill in the values:
 
 ```
 SPOTIFY_CLIENT_ID=...
@@ -86,9 +101,10 @@ SPOTIFY_REDIRECT_URI=http://127.0.0.1:8000/api/auth/callback
 TICKETMASTER_API_KEY=...
 SESSION_SECRET=<long random string>
 FRONTEND_URL=http://127.0.0.1:5173
+COOKIE_SECURE=false
 ```
 
-Generate a session secret with:
+Generate a session secret:
 ```bash
 python3 -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
@@ -111,7 +127,7 @@ pip install -r requirements.txt
 
 Start the API server:
 ```bash
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 You should see `Uvicorn running on http://127.0.0.1:8000`.
@@ -126,14 +142,36 @@ npm install
 npm run dev
 ```
 
-You should see `Local: http://127.0.0.1:5173/`. Open that URL in your browser (use `127.0.0.1`, **not** `localhost` — session cookies are scoped per hostname, and the Spotify callback returns to 127.0.0.1).
+You should see `Local: http://127.0.0.1:5173/`. Open that URL — use `127.0.0.1`, **not** `localhost` — session cookies are scoped per hostname, and the Spotify callback returns to 127.0.0.1.
 
 ### 5. Log in
 
 1. Click **Log in with Spotify**.
 2. Approve the permission grant (only `user-top-read`).
 3. You'll be redirected back to the app with your top artists loaded.
-4. Set radius and "Top artists" count, click **Find concerts**.
+4. Optionally enter a location and adjust the radius / listening window.
+5. Click **Find concerts** and watch the progress bar.
+
+---
+
+## Running tests
+
+The backend ships a pytest suite (~33 tests, runs in < 1s):
+
+```bash
+cd backend
+pip install -r requirements-dev.txt
+pytest
+```
+
+The same suite runs in CI on every push to `main` and every PR targeting `main` (`.github/workflows/ci.yml`). CI also smoke-builds the frontend with `npm run build`.
+
+Test coverage at a glance:
+- `test_auth.py` — auth status, OAuth state validation, logout, 401 paths
+- `test_jobs.py` — job-store lifecycle, ETA estimation, stale-purge
+- `test_ticketmaster.py` — retry-after-429, give-up after max attempts, param routing, progress callbacks
+- `test_geocode.py` — Nominatim happy path, cache de-dup, no-match, transport errors
+- `test_concerts_flow.py` — end-to-end POST → poll → done, geocode integration, clamp enforcement
 
 ---
 
@@ -141,23 +179,32 @@ You should see `Local: http://127.0.0.1:5173/`. Open that URL in your browser (u
 
 ```
 SpotifyConcerts/
+├── .github/workflows/
+│   └── ci.yml                  # pytest + frontend build on push/PR to main
 ├── backend/
 │   ├── app/
 │   │   ├── __init__.py
-│   │   ├── config.py          # pydantic-settings, loads .env
-│   │   ├── main.py            # FastAPI app, routes, middleware
-│   │   ├── spotify.py         # OAuth + Web API client
-│   │   └── ticketmaster.py    # Discovery API client (throttled)
-│   ├── .env.example
-│   └── requirements.txt
+│   │   ├── config.py           # pydantic-settings, loads .env
+│   │   ├── main.py             # FastAPI routes, job orchestration, input clamps
+│   │   ├── spotify.py          # OAuth + Web API client (refresh-aware)
+│   │   ├── ticketmaster.py     # Parallel Discovery API client with retries
+│   │   ├── geocode.py          # Nominatim client + LRU cache + throttle
+│   │   └── jobs.py             # In-memory async job store w/ progress + ETA
+│   ├── tests/                  # pytest suite (auth, jobs, geocode, TM, flow)
+│   ├── pytest.ini
+│   ├── requirements.txt
+│   ├── requirements-dev.txt
+│   ├── runtime.txt             # python-3.13.1 (Render pin)
+│   └── .env.example
 ├── frontend/
 │   ├── src/
-│   │   ├── App.jsx            # Top-level component, state, fetch calls
+│   │   ├── App.jsx             # Single-file app, all components inline
 │   │   ├── main.jsx
-│   │   └── index.css
+│   │   └── index.css           # Poster design system
 │   ├── index.html
 │   ├── package.json
-│   └── vite.config.js         # Proxies /api → 127.0.0.1:8000
+│   └── vite.config.js          # Proxies /api → 127.0.0.1:8000
+├── environment.yml
 ├── .gitignore
 └── README.md
 ```
@@ -166,18 +213,46 @@ SpotifyConcerts/
 
 ## API reference
 
-All endpoints are mounted under `/api`.
+All endpoints are mounted under `/api`. Auth state lives in a signed Starlette session cookie. The frontend talks to these endpoints through the Vite dev proxy at `/api`.
 
-| Method | Path                  | Description                                                                                  |
-| ------ | --------------------- | -------------------------------------------------------------------------------------------- |
-| GET    | `/api/auth/login`     | Redirects the browser to Spotify's authorize page.                                           |
-| GET    | `/api/auth/callback`  | Spotify redirects here with `code`; backend exchanges it for a token and stores it in the session. |
-| GET    | `/api/auth/status`    | `{ "authenticated": bool }`.                                                                 |
-| POST   | `/api/auth/logout`    | Clears the session.                                                                          |
-| GET    | `/api/top-artists`    | `?limit=10&time_range=long_term` — returns the user's top artists.                           |
-| GET    | `/api/concerts`       | `?latlong=lat,lng&radius=50&limit=10&time_range=long_term` — top artists' upcoming shows.    |
+| Method | Path                       | Description                                                                                                                                                                                                                            |
+| ------ | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GET    | `/api/auth/login`          | Redirects to Spotify's authorize page; stashes `oauth_state` in the session.                                                                                                                                                           |
+| GET    | `/api/auth/callback`       | Validates state, exchanges the code, stores `access_token` and `refresh_token`.                                                                                                                                                        |
+| GET    | `/api/auth/status`         | `{ "authenticated": bool }`.                                                                                                                                                                                                           |
+| POST   | `/api/auth/logout`         | Clears the session.                                                                                                                                                                                                                    |
+| GET    | `/api/top-artists`         | `?limit=10&time_range=long_term` → `[{name, image, genres}]`.                                                                                                                                                                          |
+| GET    | `/api/search-artist`       | `?q=...` → top-matching Spotify artist (used by the "Add an artist" flow).                                                                                                                                                             |
+| POST   | `/api/concerts`            | Starts an async concert search. Params: `latlong`, `city`, `state_code`, `postal_code`, `radius`, `limit`, `time_range`, `extra_artists` (repeated). Returns `{job_id, total, resolved_latlong, warning}`. Text locations are geocoded. |
+| GET    | `/api/concerts/{job_id}`   | Poll the job. Returns `{status, completed, total, elapsed_seconds, eta_seconds, results, error, warning}`. `status` is `pending` / `running` / `done` / `error`.                                                                       |
 
-Auth state is stored in a signed session cookie via Starlette's `SessionMiddleware`. The frontend talks to these endpoints through the Vite dev proxy at `/api`.
+**Server-side clamps** applied in `main.py`:
+- `radius`: 1–500 mi
+- `limit`: 1–50 artists
+- `extra_artists`: capped at 25
+
+### Job flow at a glance
+
+```
+client                            server
+  │  POST /api/concerts             │
+  │ ─────────────────────────────→  │  geocode text location (if any)
+  │                                 │  fetch top artists from Spotify
+  │                                 │  create job, spawn background task
+  │ ←──────  {job_id, total}        │
+  │                                 │  fan out: 4 artists × (find_attraction → find_events)
+  │                                 │  each completion bumps job.completed
+  │  GET /api/concerts/{job_id}     │
+  │ ─────────────────────────────→  │
+  │ ←──── {status: running,         │
+  │        completed: 7, total: 20, │
+  │        eta_seconds: 4.2}        │
+  │                                 │  (poll every 600ms, 2-min ceiling)
+  │  GET /api/concerts/{job_id}     │
+  │ ─────────────────────────────→  │
+  │ ←──── {status: done,            │
+  │        results: [...]}          │
+```
 
 ---
 
@@ -185,24 +260,27 @@ Auth state is stored in a signed session cookie via Starlette's `SessionMiddlewa
 
 ### "invalid state" after Spotify login
 
-Your browser is on a different hostname than what Spotify is redirecting to. Session cookies are scoped per *hostname*, and `localhost` ≠ `127.0.0.1` as far as the browser is concerned. Make sure:
+Your browser is on a different hostname than what Spotify is redirecting to. Session cookies are scoped per *hostname*, and `localhost` ≠ `127.0.0.1`. Make sure:
 - You access the frontend at `http://127.0.0.1:5173`.
 - Your Spotify redirect URI is exactly `http://127.0.0.1:8000/api/auth/callback`.
 - Your `.env` `FRONTEND_URL` is `http://127.0.0.1:5173`.
 
 ### Vite proxy error `ECONNREFUSED`
 
-Two possible causes:
 1. Uvicorn isn't running.
 2. Node 18+ resolves `localhost` to IPv6 (`::1`) first; if uvicorn only binds to IPv4 `127.0.0.1`, the proxy can't reach it. The `vite.config.js` in this repo already pins the proxy target to `http://127.0.0.1:8000` to avoid this.
 
+### Spotify 401 spilling out as 500
+
+You have a session minted before refresh-token storage was added. Log out and back in once — the new session will store the refresh token, and the wrapper in `_call_spotify` will silently refresh expired access tokens going forward.
+
 ### Ticketmaster `429 Too Many Requests`
 
-Free tier is 5 req/sec. The backend throttles to 4 req/sec and backs off 1s on a 429. If you still hit this, lower "Top artists" or reduce search frequency. **Never paste the failing URL into a public chat / issue / screenshot — the API key is in the query string. Rotate it immediately at the Ticketmaster developer portal if leaked.**
+Free tier is 5 req/sec. The client uses `Semaphore(4)` plus exponential-backoff retries that honor `Retry-After`. If you still hit this, lower "Top artists" or wait a moment between searches. **Never paste a failing URL into a public chat / issue / screenshot — the API key is in the query string. Rotate it immediately at the Ticketmaster portal if leaked.**
 
-### Top artists list is empty
+### Search returns nothing for a city
 
-Spotify removed several Web API endpoints in late 2024 (related artists, audio features, recommendations) and changed parts of others. If you see backend errors like `KeyError: 'genres'`, you're hitting a similar regression — check the response shape against current Spotify docs and use `.get(...)` defensively.
+The search uses Nominatim (OpenStreetMap) to geocode your text into a lat/lng. If Nominatim can't find a match, you'll see a yellow warning like *"no geocoding match for 'Wakanda'"* and the search runs without a location filter. For ambiguous city names, add a state code (`"Springfield, IL"` vs `"Springfield, MO"`) to disambiguate.
 
 ### Browser geolocation isn't populating
 
@@ -212,7 +290,11 @@ Firefox previously used Mozilla Location Service, which Mozilla shut down in mid
 - In Firefox, open `about:config` and ensure `geo.provider.use_geoclue = true` and `geo.enabled = true`.
 - Restart Firefox.
 - Chrome/Chromium uses Google's geolocation service and works out of the box.
-- Failing all that, paste lat/lng manually — Google Maps right-click → "What's here?" copies coordinates.
+- Failing all that, type lat/lng directly into the Where field (`38.6,-90.1`) — Google Maps right-click → "What's here?" copies coordinates.
+
+### Top artists list is empty
+
+Spotify removed several Web API endpoints in late 2024 (related artists, audio features, recommendations) and changed parts of others. The code uses `.get(...)` defensively for fields like `genres`. If you see backend errors of this shape, check the response against current Spotify docs.
 
 ### "invalid grant" or 403 from Spotify login
 
@@ -222,48 +304,45 @@ Your Spotify app is in Development Mode and the user trying to log in isn't on t
 
 ## Deploying to Render
 
-This project is structured for an eventual Render deployment but doesn't ship with `render.yaml` yet. A typical setup:
+Currently deployed at <https://spotifyconcerts.onrender.com>.
 
-### Option A: Two services (simpler to reason about)
+### Backend — Web Service (Python)
 
-1. **Backend Web Service** (Python):
-   - Build: `pip install -r backend/requirements.txt`
-   - Start: `cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT`
-   - Env: copy `.env` values into Render's dashboard.
-   - Set `SPOTIFY_REDIRECT_URI` to `https://<backend-service>.onrender.com/api/auth/callback` and add it as an **additional** redirect URI in the Spotify dashboard.
+- Build: `pip install -r backend/requirements.txt`
+- Start: `cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+- Env: copy `.env` values into the Render dashboard, plus:
+  - `COOKIE_SECURE=true` (HTTPS only)
+  - `FRONTEND_URL=https://<your-frontend>.onrender.com`
+  - `SPOTIFY_REDIRECT_URI=https://<your-backend>.onrender.com/api/auth/callback`
+- Add the same redirect URI to your Spotify app dashboard.
 
-2. **Frontend Static Site**:
-   - Build: `cd frontend && npm install && npm run build`
-   - Publish directory: `frontend/dist`
-   - Set `FRONTEND_URL` (in backend env) to your static site's URL.
+### Frontend — Static Site
 
-CORS middleware in `main.py` already supports cross-origin credentialed requests.
+- Build: `cd frontend && npm ci && npm run build`
+- Publish: `frontend/dist`
+- **Dashboard rewrites** (use `*`, not `:splat`, when configuring from the dashboard UI):
+  - `/api/*` → `https://<your-backend>.onrender.com/api/*` (rewrite)
+  - `/*` → `/index.html` (rewrite)
 
-### Option B: Single service (frontend served by FastAPI)
+### Pinned Python version
 
-Build the frontend, then have FastAPI serve `frontend/dist` as static files. Drop CORS and `FRONTEND_URL` complexity. Slightly more setup but only one Render service to manage.
-
-### Pin a supported Python version
-
-Render currently supports Python up to 3.13. Add a `runtime.txt` in `backend/` with:
-```
-python-3.13.1
-```
+`backend/runtime.txt` is set to `python-3.13.1` — matches Render's supported runtime and the CI matrix.
 
 ### Production hardening to consider
 
-- **Refresh tokens** — current code only stores the Spotify access token (1hr lifetime). Save the `refresh_token` from the OAuth response and add a helper to refresh on 401.
-- **Session store** — `SessionMiddleware` puts data in the cookie itself. Tokens travel on every request, and the cookie is signed but not encrypted. For production, switch to Redis-backed sessions keyed by a cookie ID.
-- **Cache Ticketmaster attraction IDs** so you don't burn a lookup request per artist on every search.
-- **Set the session cookie's `secure=True` and `same_site="none"`** when frontend and backend are on different domains over HTTPS.
+- **Session store** — `SessionMiddleware` puts data in the cookie itself. Tokens travel on every request, and the cookie is signed but not encrypted. For higher-stakes deployment, switch to Redis-backed sessions keyed by a cookie ID.
+- **Job store** — `jobs.JobStore` is in-process. Fine for a single Render instance; would need Redis for horizontal scale.
+- **Cache Ticketmaster attraction IDs** so you don't burn a lookup per artist on every search.
+- **Rate limiting** at the API edge (e.g. `slowapi`) to prevent abuse of the search knob.
 
 ---
 
 ## Known limitations
 
-- **Artist-name matching is fuzzy.** Ticketmaster's attraction search can return false positives (tribute bands, similarly named artists). A higher-accuracy strategy would be to verify the matched attraction's Spotify or MusicBrainz ID before trusting it.
+- **Artist-name matching is fuzzy.** Ticketmaster's attraction search can return false positives (tribute bands, similarly named artists). A higher-accuracy strategy would be to verify the matched attraction against a Spotify or MusicBrainz ID.
+- **Single-point radius search.** A location resolves to one centroid (city center, ZIP center, geolocation point); radius is then a great-circle filter around that point. For "anywhere in this state," geocode the state name (e.g. `"Missouri"`) to use the state's centroid.
 - **Coverage is Ticketmaster-only.** Indie / international shows are spotty. Songkick and Bandsintown have broader catalogs but harder API access.
-- **Top artists is reflective of Spotify listening only.** Doesn't account for other services or recent additions to your library that haven't been played yet.
+- **Top artists reflects Spotify listening only** — doesn't account for other services or library additions you haven't actually played.
 
 ---
 

@@ -36,6 +36,7 @@ frontend/pnpm-debug.log*
 *.swo
 *~
 .claude/
+CLAUDE.md
 
 # --- OS junk ---
 .DS_Store
