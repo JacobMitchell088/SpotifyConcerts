@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { motion, AnimatePresence, useReducedMotion } from 'framer-motion';
 
 const TIME_RANGE_LABEL = {
   short_term: 'last 4 weeks',
@@ -12,6 +13,9 @@ const ARTIST_MIN = 5;
 const ARTIST_MAX = 25;
 const RADIUS_MIN = 1;
 const RADIUS_MAX = 500;
+
+/* Strong shared easing curve (matches the CSS --ease-out token). */
+const EASE = [0.23, 1, 0.32, 1];
 
 /* Classify the "Where" field so we send the right param to the backend.
    The backend geocodes city/ZIP into lat/lng so radius search works.
@@ -66,17 +70,28 @@ function parseDate(iso) {
   return { year: y, month: MONTHS[m - 1], day: d };
 }
 
-/* Pick a column count for the artist wall that keeps the grid rectangular.
-   Prefer 5 → 4 → 6 → 3 cols. If none divides cleanly, fall back to 5 with
-   placeholder tiles padding the last row. */
-function gridDims(n) {
-  if (n <= 1) return { cols: Math.max(1, n), pad: 0 };
-  if (n <= 5) return { cols: n, pad: 0 };
-  for (const c of [5, 4, 6, 3]) {
-    if (n % c === 0) return { cols: c, pad: 0 };
+/* The "Now tracking" box is a fixed-size area. We fit N *square* tiles inside
+   it without scrolling: try every column count and keep the one that yields the
+   largest square tile that fits both the measured width and the fixed height.
+   So the grid reflows on its own — bigger tiles when there are few artists,
+   smaller as more populate — and the box (and the controls below) never move.
+   Tiles stay square, so portraits keep their proportions instead of cropping. */
+const WALL_COLS = 5; // fallback before the width is measured
+const WALL_BOX_H = 348; // px — the fixed tracking-area height
+const WALL_GAP = 12; // px — must match the CSS grid gap (0.75rem)
+const WALL_TILE_MAX = 196; // px — cap so a couple of artists don't blow up huge
+function computeWallLayout(width, n) {
+  if (!width || n <= 0) return { cols: WALL_COLS, pad: 0, tile: 0 };
+  let best = { cols: 1, tile: 0 };
+  for (let cols = 1; cols <= n; cols++) {
+    const rows = Math.ceil(n / cols);
+    const tileW = (width - (cols - 1) * WALL_GAP) / cols;
+    const tileH = (WALL_BOX_H - (rows - 1) * WALL_GAP) / rows;
+    const tile = Math.min(tileW, tileH);
+    if (tile > best.tile) best = { cols, tile };
   }
-  const cols = 5;
-  return { cols, pad: (cols - (n % cols)) % cols };
+  const pad = (best.cols - (n % best.cols)) % best.cols;
+  return { cols: best.cols, pad, tile: Math.min(best.tile, WALL_TILE_MAX) };
 }
 
 
@@ -91,8 +106,36 @@ function SpotifyMark(props) {
 }
 
 
+/* Kinetic masked-line headline. `lines` is an array of strings or JSX. */
+function MaskHeadline({ lines, className, delay = 0.1 }) {
+  const reduce = useReducedMotion();
+  return (
+    <h1 className={className}>
+      {lines.map((ln, i) => (
+        <span className="mask-line" key={i}>
+          <motion.span
+            className="mask-inner"
+            initial={reduce ? false : { y: '108%' }}
+            animate={{ y: 0 }}
+            transition={{ duration: 0.85, ease: EASE, delay: delay + i * 0.085 }}
+          >
+            {ln}
+          </motion.span>
+        </span>
+      ))}
+    </h1>
+  );
+}
+
+
 export default function App() {
+  // boot: 'connecting' until the first /api/auth/status resolves. On a cold
+  // Render free-tier instance that request hangs while the service wakes —
+  // we surface the press-warmup screen during the wait.
+  const [boot, setBoot] = useState('connecting');
+  const [coldVisible, setColdVisible] = useState(false);
   const [authed, setAuthed] = useState(false);
+
   const [topArtists, setTopArtists] = useState([]);
   const [customArtists, setCustomArtists] = useState([]); // [{name, image}]
   const [customInput, setCustomInput] = useState('');
@@ -106,19 +149,57 @@ export default function App() {
   const [whereInput, setWhereInput] = useState(''); // city or ZIP
   const [radius, setRadius] = useState(50);
   const [artistCount, setArtistCount] = useState(10);
-  // Debounced shadow of artistCount — drives the top-artists refetch so that
-  // dragging the number input doesn't fire a request on every keystroke.
   const [debouncedArtistCount, setDebouncedArtistCount] = useState(10);
   const [timeRange, setTimeRange] = useState('long_term');
   const [locating, setLocating] = useState(false);
   const [statusMsg, setStatusMsg] = useState('');
 
-  /* ---- auth bootstrap ---- */
+  /* Measured width of the artist wall, so the grid can size square tiles to
+     fit the fixed-height area. A callback ref wires up a ResizeObserver when the
+     wall mounts (it only exists in the 'main' phase) and tears it down on
+     unmount, keeping the width correct across resizes. */
+  const wallRO = useRef(null);
+  const [wallW, setWallW] = useState(0);
+  const wallRef = useCallback((el) => {
+    if (wallRO.current) {
+      wallRO.current.disconnect();
+      wallRO.current = null;
+    }
+    if (el) {
+      setWallW(el.clientWidth);
+      wallRO.current = new ResizeObserver(([e]) => setWallW(e.contentRect.width));
+      wallRO.current.observe(el);
+    }
+  }, []);
+
+  /* ---- boot probe + auth bootstrap ---- */
   useEffect(() => {
-    fetch('/api/auth/status', { credentials: 'include' })
-      .then((r) => r.json())
-      .then((d) => setAuthed(d.authenticated))
-      .catch(() => setAuthed(false));
+    let cancelled = false;
+    // Only reveal the warmup screen if the probe is genuinely slow; a warm
+    // backend resolves in well under this and skips the screen entirely.
+    const slowTimer = setTimeout(() => {
+      if (!cancelled) setColdVisible(true);
+    }, 550);
+
+    const probe = async () => {
+      try {
+        const r = await fetch('/api/auth/status', { credentials: 'include' });
+        const d = await r.json();
+        if (cancelled) return;
+        setAuthed(!!d.authenticated);
+        setBoot('ready');
+      } catch {
+        if (cancelled) return;
+        // Transport error (service unreachable) — keep the press running and retry.
+        setColdVisible(true);
+        setTimeout(probe, 2500);
+      }
+    };
+    probe();
+    return () => {
+      cancelled = true;
+      clearTimeout(slowTimer);
+    };
   }, []);
 
   /* ---- debounce artistCount changes to avoid refetch-per-keystroke ---- */
@@ -354,9 +435,11 @@ export default function App() {
     }
   };
 
-  if (!authed) {
-    return <Landing onLogin={login} />;
-  }
+  /* ---- which screen is showing ---- */
+  let phase = 'blank';
+  if (boot === 'connecting') phase = coldVisible ? 'cold' : 'blank';
+  else if (!authed) phase = 'landing';
+  else phase = 'main';
 
   const allArtists = [
     ...topArtists.map((a, i) => ({
@@ -373,7 +456,7 @@ export default function App() {
     })),
   ];
 
-  const { cols, pad } = gridDims(allArtists.length);
+  const { cols, pad, tile } = computeWallLayout(wallW, allArtists.length);
 
   const groupedByArtist = allArtists.map((a, i) => ({
     artist: a.name,
@@ -385,288 +468,292 @@ export default function App() {
 
   const anyShows = groupedByArtist.some((g) => g.shows.length > 0);
 
+  const screenFade = {
+    initial: { opacity: 0 },
+    animate: { opacity: 1, transition: { duration: 0.5, ease: EASE } },
+    exit: { opacity: 0, transition: { duration: 0.3, ease: EASE } },
+  };
+
   return (
-    <div className="page">
-      <Masthead authed onLogout={logout} />
+    <AnimatePresence mode="wait">
+      {phase === 'blank' && <div key="blank" style={{ minHeight: '100dvh' }} />}
 
-      <main>
-        <section className="rise">
-          <div className="section-head">
-            <h2 className="display">Now tracking</h2>
-            <span className="kicker">
-              {TIME_RANGE_LABEL[timeRange]} · {topArtists.length} top
-              {customArtists.length > 0 && ` · ${customArtists.length} added`}
-            </span>
-          </div>
-          <p className="muted" style={{ marginTop: 0, maxWidth: '52ch' }}>
-            We'll match each of these against upcoming shows on Ticketmaster. Add
-            your own artists below if they're not in your top listened, or adjust
-            the controls to widen or narrow the scope.
-          </p>
-        </section>
+      {phase === 'cold' && <ColdStart key="cold" />}
 
-        <div
-          className="artists-wall rise-stagger"
-          style={{ marginTop: '1.5rem', '--cols': cols }}
-        >
-          {allArtists.map((a) => (
-            <article
-              key={(a.custom ? 'c:' : 't:') + a.name}
-              className={
-                'artist-tile' +
-                (a.image ? '' : ' no-image') +
-                (a.custom ? ' custom' : '')
-              }
-            >
-              {a.image && (
-                <>
-                  <div
-                    className="image"
-                    style={{ backgroundImage: `url(${a.image})` }}
-                    role="presentation"
-                  />
-                  <div className="shade" aria-hidden="true" />
-                </>
-              )}
-              <span className="num">{a.label}</span>
-              {a.custom && (
-                <button
-                  className="remove-custom"
-                  onClick={() => removeCustomArtist(a.name)}
-                  aria-label={`Remove ${a.name}`}
-                  title={`Remove ${a.name}`}
-                >
-                  ×
-                </button>
-              )}
-              <div className="name">{a.name}</div>
-            </article>
-          ))}
-          {Array.from({ length: pad }, (_, i) => (
-            <div
-              key={`pad-${i}`}
-              className="artist-tile placeholder"
-              aria-hidden="true"
-            />
-          ))}
-        </div>
+      {phase === 'landing' && (
+        <motion.div key="landing" {...screenFade}>
+          <Landing onLogin={login} />
+        </motion.div>
+      )}
 
-        <div className="add-artist-bar">
-          <span className="label-mono">Add an artist</span>
-          <input
-            value={customInput}
-            placeholder="Type a band or performer, then Enter"
-            onChange={(e) => setCustomInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                e.preventDefault();
-                addCustomArtist();
-              }
-            }}
-          />
-          <button
-            className="btn-ghost"
-            onClick={addCustomArtist}
-            disabled={!customInput.trim() || addingArtist}
-          >
-            {addingArtist ? '…' : 'Add'}
-          </button>
-        </div>
+      {phase === 'main' && (
+        <motion.div key="main" {...screenFade} className="page">
+          <Masthead authed onLogout={logout} />
 
-        <section className="rise">
-          <div className="section-head">
-            <h2 className="display">Search</h2>
-            <span className="kicker">Set your zone of interest</span>
-          </div>
-
-          <div className="controls-strip">
-            <div className="ctrl ctrl-location">
-              <span className="label-mono">
-                Where
-                <span className="ctrl-hint">city, ZIP, "City, ST", or lat,lng</span>
-              </span>
-              <div className="ctrl-row">
-                <input
-                  placeholder={
-                    latlong
-                      ? 'Using your location'
-                      : 'St. Louis, MO  ·  11201  ·  38.6,-90.1'
-                  }
-                  value={whereInput}
-                  disabled={!!latlong}
-                  onChange={(e) => setWhereInput(e.target.value)}
-                />
-                <button
-                  className="btn-ghost"
-                  onClick={latlong ? () => setLatlong('') : populateLocation}
-                  disabled={locating}
-                  title={latlong ? 'Clear current location' : 'Use browser location'}
-                >
-                  {locating ? '…' : latlong ? 'Clear' : 'Use mine'}
-                </button>
+          <main>
+            <section>
+              <div className="section-head">
+                <h2 className="display">Now tracking</h2>
+                <span className="kicker">
+                  {TIME_RANGE_LABEL[timeRange]} · {topArtists.length} top
+                  {customArtists.length > 0 && ` · ${customArtists.length} added`}
+                </span>
               </div>
-              <span className="ctrl-readout">
-                {latlong
-                  ? `→ using ${latlong}`
-                  : describeParsedLocation(parseLocation(whereInput))}
-              </span>
-            </div>
+              <p className="muted" style={{ marginTop: 0, maxWidth: '52ch' }}>
+                We'll match each of these against upcoming shows on Ticketmaster. Add
+                your own artists below if they're not in your top listened, or adjust
+                the controls to widen or narrow the scope.
+              </p>
+            </section>
 
-            <div className="ctrl">
-              <span className="label-mono">
-                Radius
-                <span className="ctrl-hint">{RADIUS_MIN}–{RADIUS_MAX} mi</span>
-              </span>
+            <motion.div
+              ref={wallRef}
+              className="artists-wall"
+              style={{
+                marginTop: '1.5rem',
+                '--cols': cols,
+                '--wall-box-h': `${WALL_BOX_H}px`,
+                '--tile': `${tile}px`,
+              }}
+              initial="hidden"
+              animate="show"
+              variants={{
+                hidden: {},
+                show: { transition: { staggerChildren: 0.04, delayChildren: 0.05 } },
+              }}
+            >
+              {allArtists.map((a) => (
+                <ArtistTile
+                  key={(a.custom ? 'c:' : 't:') + a.name}
+                  a={a}
+                  onRemove={removeCustomArtist}
+                />
+              ))}
+              {Array.from({ length: pad }, (_, i) => (
+                <div
+                  key={`pad-${i}`}
+                  className="artist-tile placeholder"
+                  aria-hidden="true"
+                />
+              ))}
+            </motion.div>
+
+            <div className="add-artist-bar">
+              <span className="label-mono">Add an artist</span>
               <input
-                type="number"
-                min={RADIUS_MIN}
-                max={RADIUS_MAX}
-                value={radius}
-                onChange={(e) => {
-                  const n = Number(e.target.value);
-                  if (e.target.value === '') {
-                    setRadius('');
-                  } else if (Number.isFinite(n)) {
-                    setRadius(Math.max(RADIUS_MIN, Math.min(RADIUS_MAX, n)));
+                value={customInput}
+                placeholder="Type a band or performer, then Enter"
+                onChange={(e) => setCustomInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    addCustomArtist();
                   }
-                }}
-                onBlur={() => {
-                  // Snap empty / invalid back to a sane default.
-                  const n = Number(radius);
-                  if (!Number.isFinite(n) || n < RADIUS_MIN) setRadius(RADIUS_MIN);
                 }}
               />
-              <span className="ctrl-readout" aria-hidden="true" />
-            </div>
-
-            <div className="ctrl">
-              <span className="label-mono">
-                Top artists
-                <span className="ctrl-hint">{ARTIST_MIN}–{ARTIST_MAX}</span>
-              </span>
-              <div className="ctrl-row stepper">
-                <button
-                  type="button"
-                  className="stepper-btn"
-                  onClick={() => stepArtistCount(-1)}
-                  disabled={Number(artistCount) <= ARTIST_MIN}
-                  aria-label="Decrease top artists"
-                  title="Fewer artists"
-                >
-                  −
-                </button>
-                <input
-                  type="number"
-                  min={ARTIST_MIN}
-                  max={ARTIST_MAX}
-                  value={artistCount}
-                  onChange={(e) => {
-                    const n = Number(e.target.value);
-                    if (e.target.value === '') {
-                      setArtistCount('');
-                    } else if (Number.isFinite(n)) {
-                      setArtistCount(Math.max(ARTIST_MIN, Math.min(ARTIST_MAX, n)));
-                    }
-                  }}
-                  onBlur={() => {
-                    const n = Number(artistCount);
-                    if (!Number.isFinite(n) || n < ARTIST_MIN) setArtistCount(ARTIST_MIN);
-                  }}
-                />
-                <button
-                  type="button"
-                  className="stepper-btn"
-                  onClick={() => stepArtistCount(1)}
-                  disabled={Number(artistCount) >= ARTIST_MAX}
-                  aria-label="Increase top artists"
-                  title="More artists"
-                >
-                  +
-                </button>
-              </div>
-              <span className="ctrl-readout" aria-hidden="true" />
-            </div>
-
-            <div className="ctrl">
-              <span className="label-mono">
-                Listening window
-                <span className="ctrl-hint">how far back</span>
-              </span>
-              <select
-                value={timeRange}
-                onChange={(e) => setTimeRange(e.target.value)}
-              >
-                <option value="short_term">Last 4 weeks</option>
-                <option value="medium_term">Last 6 months</option>
-                <option value="long_term">Last year</option>
-              </select>
-              <span className="ctrl-readout" aria-hidden="true" />
-            </div>
-
-            <div className="ctrl ctrl-submit-cell">
-              {/* Spacer occupying the label row so the button vertically
-                  aligns with inputs in neighboring columns. */}
-              <span className="label-mono" aria-hidden="true">&nbsp;</span>
               <button
-                className="btn-primary ctrl-submit"
-                onClick={loadConcerts}
-                disabled={loading}
+                className="btn-ghost"
+                onClick={addCustomArtist}
+                disabled={!customInput.trim() || addingArtist}
               >
-                {loading ? 'Searching…' : 'Find concerts'}
-                {!loading && <span className="arrow">→</span>}
+                {addingArtist ? '…' : 'Add'}
               </button>
-              <span className="ctrl-readout" aria-hidden="true" />
             </div>
-          </div>
 
-          <p className="controls-hint">
-            Leave location blank to search all upcoming shows for these artists.
-            &nbsp;&middot;&nbsp; Short · 4 weeks &nbsp;&middot;&nbsp; Medium · 6 months
-            &nbsp;&middot;&nbsp; Long · 1 year
-          </p>
+            <section>
+              <div className="section-head">
+                <h2 className="display">Search</h2>
+                <span className="kicker">Set your zone of interest</span>
+              </div>
 
-          {loading && progress && progress.total > 0 && (
-            <ProgressBar progress={progress} />
-          )}
+              <div className="controls-strip">
+                <div className="ctrl ctrl-location">
+                  <span className="label-mono">
+                    Where
+                    <span className="ctrl-hint">city, ZIP, "City, ST", or lat,lng</span>
+                  </span>
+                  <div className="ctrl-row">
+                    <input
+                      placeholder={
+                        latlong
+                          ? 'Using your location'
+                          : 'St. Louis, MO  ·  11201  ·  38.6,-90.1'
+                      }
+                      value={whereInput}
+                      disabled={!!latlong}
+                      onChange={(e) => setWhereInput(e.target.value)}
+                    />
+                    <button
+                      className="btn-ghost"
+                      onClick={latlong ? () => setLatlong('') : populateLocation}
+                      disabled={locating}
+                      title={latlong ? 'Clear current location' : 'Use browser location'}
+                    >
+                      {locating ? '…' : latlong ? 'Clear' : 'Use mine'}
+                    </button>
+                  </div>
+                  <span className="ctrl-readout">
+                    {latlong
+                      ? `→ using ${latlong}`
+                      : describeParsedLocation(parseLocation(whereInput))}
+                  </span>
+                </div>
 
-          {statusMsg && <p className="controls-status">{statusMsg}</p>}
-        </section>
+                <div className="ctrl">
+                  <span className="label-mono">
+                    Radius
+                    <span className="ctrl-hint">{RADIUS_MIN}–{RADIUS_MAX} mi</span>
+                  </span>
+                  <input
+                    type="number"
+                    min={RADIUS_MIN}
+                    max={RADIUS_MAX}
+                    value={radius}
+                    onChange={(e) => {
+                      const n = Number(e.target.value);
+                      if (e.target.value === '') {
+                        setRadius('');
+                      } else if (Number.isFinite(n)) {
+                        setRadius(Math.max(RADIUS_MIN, Math.min(RADIUS_MAX, n)));
+                      }
+                    }}
+                    onBlur={() => {
+                      const n = Number(radius);
+                      if (!Number.isFinite(n) || n < RADIUS_MIN) setRadius(RADIUS_MIN);
+                    }}
+                  />
+                  <span className="ctrl-readout" aria-hidden="true" />
+                </div>
 
-        <section className="results">
-          <div className="section-head">
-            <h2 className="display">Upcoming shows</h2>
-            <span className="kicker">
-              {!searched && 'Awaiting search'}
-              {searched && loading && 'Working…'}
-              {searched && !loading && anyShows && 'Compiled'}
-              {searched && !loading && !anyShows && 'No matches in range'}
-            </span>
-          </div>
+                <div className="ctrl">
+                  <span className="label-mono">
+                    Top artists
+                    <span className="ctrl-hint">{ARTIST_MIN}–{ARTIST_MAX}</span>
+                  </span>
+                  <div className="ctrl-row stepper">
+                    <button
+                      type="button"
+                      className="stepper-btn"
+                      onClick={() => stepArtistCount(-1)}
+                      disabled={Number(artistCount) <= ARTIST_MIN}
+                      aria-label="Decrease top artists"
+                      title="Fewer artists"
+                    >
+                      −
+                    </button>
+                    <input
+                      type="number"
+                      min={ARTIST_MIN}
+                      max={ARTIST_MAX}
+                      value={artistCount}
+                      onChange={(e) => {
+                        const n = Number(e.target.value);
+                        if (e.target.value === '') {
+                          setArtistCount('');
+                        } else if (Number.isFinite(n)) {
+                          setArtistCount(Math.max(ARTIST_MIN, Math.min(ARTIST_MAX, n)));
+                        }
+                      }}
+                      onBlur={() => {
+                        const n = Number(artistCount);
+                        if (!Number.isFinite(n) || n < ARTIST_MIN) setArtistCount(ARTIST_MIN);
+                      }}
+                    />
+                    <button
+                      type="button"
+                      className="stepper-btn"
+                      onClick={() => stepArtistCount(1)}
+                      disabled={Number(artistCount) >= ARTIST_MAX}
+                      aria-label="Increase top artists"
+                      title="More artists"
+                    >
+                      +
+                    </button>
+                  </div>
+                  <span className="ctrl-readout" aria-hidden="true" />
+                </div>
 
-          {!searched && !loading && (
-            <p className="results-empty">
-              Hit <strong>Find concerts</strong> above to compile listings.
-            </p>
-          )}
+                <div className="ctrl">
+                  <span className="label-mono">
+                    Listening window
+                    <span className="ctrl-hint">how far back</span>
+                  </span>
+                  <select
+                    value={timeRange}
+                    onChange={(e) => setTimeRange(e.target.value)}
+                  >
+                    <option value="short_term">Last 4 weeks</option>
+                    <option value="medium_term">Last 6 months</option>
+                    <option value="long_term">Last year</option>
+                  </select>
+                  <span className="ctrl-readout" aria-hidden="true" />
+                </div>
 
-          {searched && !loading && !anyShows && (
-            <p className="results-empty">
-              {lastSearchUsedLocation
-                ? `No upcoming shows found within ${radius} miles. Widen the radius or clear the location to see all shows.`
-                : 'No upcoming shows found for these artists. Try the longer listening window, add artists manually, or check back later.'}
-            </p>
-          )}
+                <div className="ctrl ctrl-submit-cell">
+                  {/* Spacer occupying the label row so the button aligns with inputs. */}
+                  <span className="label-mono" aria-hidden="true">&nbsp;</span>
+                  <button
+                    className="btn-primary ctrl-submit"
+                    onClick={loadConcerts}
+                    disabled={loading}
+                  >
+                    {loading ? 'Searching…' : 'Find concerts'}
+                    {!loading && <span className="arrow">→</span>}
+                  </button>
+                  <span className="ctrl-readout" aria-hidden="true" />
+                </div>
+              </div>
 
-          {groupedByArtist.map((g) =>
-            g.shows.length === 0 ? null : (
-              <ArtistBlock key={g.artist} group={g} />
-            )
-          )}
-        </section>
-      </main>
+              <p className="controls-hint">
+                Leave location blank to search all upcoming shows for these artists.
+                &nbsp;&middot;&nbsp; Short · 4 weeks &nbsp;&middot;&nbsp; Medium · 6 months
+                &nbsp;&middot;&nbsp; Long · 1 year
+              </p>
 
-      <Colophon />
-    </div>
+              {loading && progress && progress.total > 0 && (
+                <ProgressBar progress={progress} />
+              )}
+
+              {statusMsg && <p className="controls-status">{statusMsg}</p>}
+            </section>
+
+            <section className="results">
+              <div className="section-head">
+                <h2 className="display">Upcoming shows</h2>
+                <span className="kicker">
+                  {!searched && 'Awaiting search'}
+                  {searched && loading && 'Working…'}
+                  {searched && !loading && anyShows && 'Compiled'}
+                  {searched && !loading && !anyShows && 'No matches in range'}
+                </span>
+              </div>
+
+              {!searched && !loading && (
+                <p className="results-empty">
+                  Hit <strong>Find concerts</strong> above to compile listings.
+                </p>
+              )}
+
+              {searched && !loading && !anyShows && (
+                <p className="results-empty">
+                  {lastSearchUsedLocation
+                    ? `No upcoming shows found within ${radius} miles. Widen the radius or clear the location to see all shows.`
+                    : 'No upcoming shows found for these artists. Try the longer listening window, add artists manually, or check back later.'}
+                </p>
+              )}
+
+              {groupedByArtist.map((g) =>
+                g.shows.length === 0 ? null : (
+                  <ArtistBlock key={g.artist} group={g} />
+                )
+              )}
+            </section>
+          </main>
+
+          <Colophon />
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
 }
 
@@ -681,7 +768,7 @@ function Masthead({ authed, onLogout }) {
         <span className="line-2">Concerts</span>
       </div>
       <div className="masthead-side">
-        <span className="label-mono">Volume 01 · No. 01</span>
+        <span className="label-mono">Vol. 01 · No. 01</span>
         <span className="issue">A live music compendium</span>
         {authed && (
           <button
@@ -698,44 +785,251 @@ function Masthead({ authed, onLogout }) {
 }
 
 
-function Landing({ onLogin }) {
+/* Cold-start "warming up the press" — themed wait while the backend wakes.
+   The ticket prints up out of the slot; status lines cycle; elapsed counter
+   makes the wait feel honest. Pure framer-motion, transform/opacity only. */
+function ColdStart() {
+  const reduce = useReducedMotion();
+  const LINES = [
+    'Warming up the press…',
+    'Inking the rollers…',
+    'Aligning the perforation…',
+    'Cutting your ticket…',
+    'Almost there…',
+  ];
+  const [line, setLine] = useState(0);
+  const [elapsed, setElapsed] = useState(0);
+
+  useEffect(() => {
+    const a = setInterval(() => setLine((i) => Math.min(i + 1, LINES.length - 1)), 2600);
+    const b = setInterval(() => setElapsed((s) => s + 1), 1000);
+    return () => {
+      clearInterval(a);
+      clearInterval(b);
+    };
+  }, []);
+
+  // pseudo-random but stable barcode bars
+  const bars = [3, 1, 2, 1, 4, 1, 2, 3, 1, 2, 1, 3, 2, 1, 4, 1, 2, 1];
+
   return (
-    <div className="page">
+    <motion.div
+      className="cold"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1, transition: { duration: 0.4, ease: EASE } }}
+      exit={{ opacity: 0, transition: { duration: 0.3 } }}
+    >
+      <div className="cold-inner">
+        <div className="cold-brand">
+          Spotify <span className="em">Concerts</span>
+        </div>
+
+        <div className="press">
+          <motion.div
+            className="press-ticket"
+            initial={reduce ? false : { y: 130, rotate: -1 }}
+            animate={{
+              y: reduce ? 0 : [130, 4, 8, 4],
+              rotate: reduce ? 0 : [-1, 0.4, -0.3, 0.4],
+            }}
+            transition={
+              reduce
+                ? { duration: 0 }
+                : { duration: 4.2, ease: EASE, repeat: Infinity, repeatType: 'reverse' }
+            }
+          >
+            <div className="pt-top">
+              <span>Admit One</span>
+              <span>Sec · Row · Seat</span>
+            </div>
+            <div className="pt-title">Live<br />Music</div>
+            <div className="pt-bars">
+              {bars.map((w, i) => (
+                <i key={i} style={{ width: `${w * 2}px` }} />
+              ))}
+            </div>
+          </motion.div>
+          <div className="press-slot" />
+        </div>
+
+        <div className="cold-status" aria-live="polite">
+          <AnimatePresence mode="wait">
+            <motion.span
+              key={line}
+              initial={reduce ? false : { y: 10, opacity: 0 }}
+              animate={{ y: 0, opacity: 1 }}
+              exit={reduce ? {} : { y: -10, opacity: 0 }}
+              transition={{ duration: 0.35, ease: EASE }}
+            >
+              {LINES[line]}
+            </motion.span>
+          </AnimatePresence>
+        </div>
+
+        <div className="cold-feed" aria-hidden="true">
+          <motion.i
+            initial={{ x: '-100%' }}
+            animate={{ x: '350%' }}
+            transition={{ duration: 1.4, ease: 'linear', repeat: Infinity }}
+          />
+        </div>
+
+        <div className="cold-elapsed">
+          Free-tier server waking — this usually takes about 60s · {elapsed}s
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
+
+function Landing({ onLogin }) {
+  const reduce = useReducedMotion();
+  const fadeUp = {
+    initial: reduce ? false : { y: 20, opacity: 0 },
+    animate: { y: 0, opacity: 1 },
+  };
+  return (
+    <div className="page landing-wrap">
       <Masthead authed={false} />
 
       <section className="landing">
-        <div className="landing-eyebrow">
-          <span className="kicker">An offering</span>
+        <div>
+          <motion.span
+            className="landing-eyebrow"
+            {...fadeUp}
+            transition={{ duration: 0.6, ease: EASE, delay: 0.05 }}
+          >
+            <span className="dot" /> An offering
+          </motion.span>
+
+          <MaskHeadline
+            className="landing-headline"
+            delay={0.15}
+            lines={[
+              'Your next',
+              'show is',
+              <span className="accent" key="a">out there.</span>,
+            ]}
+          />
+
+          <motion.p
+            className="landing-sub"
+            {...fadeUp}
+            transition={{ duration: 0.6, ease: EASE, delay: 0.55 }}
+          >
+            Sign in with Spotify. We'll pull your most-listened artists and match
+            them against upcoming shows on Ticketmaster — anywhere you set the radius.
+          </motion.p>
+
+          <motion.div
+            className="landing-cta"
+            {...fadeUp}
+            transition={{ duration: 0.6, ease: EASE, delay: 0.7 }}
+          >
+            <button className="btn-spotify" onClick={onLogin}>
+              <span className="ico"><SpotifyMark /></span>
+              <span>Log in with Spotify</span>
+            </button>
+            <span className="landing-credit">
+              Concert data via{' '}
+              <span className="brand-wordmark ticketmaster">TICKETMASTER</span>
+              &nbsp;&middot;&nbsp;Listening data via{' '}
+              <span className="brand-wordmark spotify">Spotify</span>
+            </span>
+          </motion.div>
         </div>
 
-        <h1 className="landing-headline">
-          <span>Your next</span>
-          <span>show is</span>
-          <span className="accent">out there.</span>
-        </h1>
-
-        <p className="landing-sub">
-          Sign in with Spotify. We&rsquo;ll pull your most-listened artists and
-          match them against upcoming shows on Ticketmaster — anywhere you set
-          the radius.
-        </p>
-
-        <div className="landing-cta">
-          <button className="btn-spotify" onClick={onLogin}>
-            <SpotifyMark />
-            <span>Log in with Spotify</span>
-          </button>
-          <span className="landing-credit">
-            Concert data via{' '}
-            <span className="brand-wordmark ticketmaster">TICKETMASTER</span>
-            &nbsp;&middot;&nbsp;Listening data via{' '}
-            <span className="brand-wordmark spotify">Spotify</span>
-          </span>
-        </div>
+        <motion.div
+          initial={reduce ? false : { opacity: 0, y: 30, rotate: 6 }}
+          animate={{ opacity: 1, y: 0, rotate: 2 }}
+          transition={{ duration: 0.85, ease: EASE, delay: 0.35 }}
+        >
+          <HeroTicket />
+        </motion.div>
       </section>
 
       <Colophon />
     </div>
+  );
+}
+
+
+function HeroTicket() {
+  const bars = [3, 1, 2, 1, 4, 2, 1, 3, 1, 2, 1, 3];
+  return (
+    <div className="hero-ticket">
+      <div className="ht-body">
+        <div className="ht-row">
+          <span>Box Office</span>
+          <span>General Admission</span>
+        </div>
+        <div className="ht-big">
+          One night<br />
+          <em>only.</em>
+        </div>
+        <div className="ht-meta">
+          <span>DOORS · WHEN YOU'RE READY</span>
+          <span>VENUE · ANYWHERE IN RANGE</span>
+          <span>PRICE · A FREE LOGIN</span>
+        </div>
+      </div>
+
+      <div className="ht-foil">
+        <span className="admit">Admit One</span>
+        <span className="yr">'26</span>
+        <span className="bars" aria-hidden="true">
+          {bars.map((w, i) => (
+            <i key={i} style={{ width: `${w * 2}px` }} />
+          ))}
+        </span>
+      </div>
+
+      <span className="perf-v" />
+      <span className="notch" style={{ top: -11, right: 'calc(124px - 11px)' }} />
+      <span className="notch" style={{ bottom: -11, right: 'calc(124px - 11px)' }} />
+    </div>
+  );
+}
+
+
+function ArtistTile({ a, onRemove }) {
+  const reduce = useReducedMotion();
+  return (
+    <motion.article
+      className={
+        'artist-tile' +
+        (a.image ? '' : ' no-image') +
+        (a.custom ? ' custom' : '')
+      }
+      variants={{
+        hidden: reduce ? { opacity: 0 } : { opacity: 0, y: 14 },
+        show: { opacity: 1, y: 0, transition: { duration: 0.5, ease: EASE } },
+      }}
+    >
+      {a.image && (
+        <>
+          <div
+            className="image"
+            style={{ backgroundImage: `url(${a.image})` }}
+            role="presentation"
+          />
+          <div className="shade" aria-hidden="true" />
+        </>
+      )}
+      <span className="num">{a.label}</span>
+      {a.custom && (
+        <button
+          className="remove-custom"
+          onClick={() => onRemove(a.name)}
+          aria-label={`Remove ${a.name}`}
+          title={`Remove ${a.name}`}
+        >
+          ×
+        </button>
+      )}
+      <div className="name">{a.name}</div>
+    </motion.article>
   );
 }
 
@@ -775,31 +1069,60 @@ function ArtistBlock({ group }) {
           {group.shows.length} show{group.shows.length > 1 ? 's' : ''}
         </span>
       </header>
-      <div className="show-list">
+      <motion.div
+        className="show-list"
+        initial="hidden"
+        animate="show"
+        variants={{
+          hidden: {},
+          show: { transition: { staggerChildren: 0.05 } },
+        }}
+      >
         {group.shows.map((c, i) => (
           <ShowStub key={i} show={c} />
         ))}
-      </div>
+      </motion.div>
     </section>
   );
 }
 
 
 function ShowStub({ show }) {
+  const reduce = useReducedMotion();
   const d = parseDate(show.date);
   return (
-    <article className="show-stub">
-      <div className="stub-date">
+    <motion.article
+      className="show-stub"
+      variants={{
+        hidden: reduce ? { opacity: 0 } : { opacity: 0, y: 16 },
+        show: { opacity: 1, y: 0, transition: { duration: 0.5, ease: EASE } },
+      }}
+    >
+      <div className="stub-foil">
         {d ? (
           <>
             <span className="month">{d.month}</span>
-            <span className="day">{d.day}</span>
+            <span className="day-mask">
+              <motion.span
+                className="day"
+                initial={reduce ? false : { y: '108%' }}
+                animate={{ y: 0 }}
+                transition={{ duration: 0.6, ease: EASE, delay: 0.15 }}
+              >
+                {d.day}
+              </motion.span>
+            </span>
             <span className="year">{d.year}</span>
           </>
         ) : (
-          <span className="month">TBA</span>
+          <span className="tba">TBA</span>
         )}
       </div>
+
+      <span className="stub-perf" aria-hidden="true" />
+      <span className="notch top" aria-hidden="true" />
+      <span className="notch bot" aria-hidden="true" />
+
       <div className="stub-body">
         <div className="stub-event">{show.name}</div>
         <div className="stub-venue">
@@ -822,7 +1145,7 @@ function ShowStub({ show }) {
           </a>
         )}
       </div>
-    </article>
+    </motion.article>
   );
 }
 
