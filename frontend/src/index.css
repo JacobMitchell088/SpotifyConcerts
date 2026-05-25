@@ -437,13 +437,10 @@ button {
   letter-spacing: 0.24em;
   text-transform: uppercase;
   color: var(--ink-mute);
-  padding: 0.35rem 0.8rem;
-  border: 1.5px solid var(--line);
-  border-radius: 999px;
   margin-bottom: 1.6rem;
 }
 .landing-eyebrow .dot {
-  width: 7px; height: 7px; border-radius: 999px; background: var(--spotify);
+  width: 22px; height: 1.5px; border-radius: 0; background: var(--ember);
 }
 
 .landing-headline {
